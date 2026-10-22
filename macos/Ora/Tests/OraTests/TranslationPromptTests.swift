@@ -2,26 +2,27 @@ import XCTest
 @testable import Ora
 
 final class TranslationPromptTests: XCTestCase {
-    func testPromptWithoutHistoryMatchesLegacyShape() {
-        let p = buildTranslationPrompt(targetLanguage: "English", text: "你好世界")
-        XCTAssertEqual(
-            p,
-            "Translate to English. Output only the translation.\n\nSource: 你好世界\nEnglish: "
-        )
+    func testUtteranceHasNoSyntheticSourceLabel() {
+        let messages = buildTranslationMessages(targetLanguage: "Chinese", text: "This is a fork.")
+        XCTAssertEqual(messages.map(\.role), ["system", "user"])
+        XCTAssertEqual(messages.last?.content, "This is a fork.")
+        XCTAssertTrue(messages.first?.content.contains("Chinese") == true)
+        XCTAssertFalse(messages.contains { $0.content.contains("Source:") })
     }
 
-    func testPromptWithHistoryInterleavesPairsBeforeNewSource() {
-        let history = [
-            TranslationExchange(source: "早上好", translation: "Good morning"),
-            TranslationExchange(source: "我叫小王", translation: "My name is Xiao Wang"),
-        ]
-        let p = buildTranslationPrompt(targetLanguage: "English", text: "很高兴认识你", history: history)
-        let expected =
-            "Translate to English. Output only the translation.\n\n"
-            + "Source: 早上好\nEnglish: Good morning\n\n"
-            + "Source: 我叫小王\nEnglish: My name is Xiao Wang\n\n"
-            + "Source: 很高兴认识你\nEnglish: "
-        XCTAssertEqual(p, expected)
+    func testContextIsSeparateConversationTurns() {
+        let history = [TranslationExchange(source: "Good morning.", translation: "早上好。")]
+        let messages = buildTranslationMessages(targetLanguage: "Chinese", text: "Good evening.", history: history)
+        XCTAssertEqual(messages.map(\.role), ["system", "user", "assistant", "user"])
+        XCTAssertEqual(messages[1].content, "Good morning.")
+        XCTAssertEqual(messages[2].content, "早上好。")
+        XCTAssertEqual(messages[3].content, "Good evening.")
+    }
+
+    func testLiteralSourceLabelsInSpeechArePreserved() {
+        let speech = "Source: Wikipedia. 来源：维基百科。"
+        let messages = buildTranslationMessages(targetLanguage: "Chinese", text: speech)
+        XCTAssertEqual(messages.last?.content, speech)
     }
 }
 

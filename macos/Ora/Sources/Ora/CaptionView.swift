@@ -1,9 +1,8 @@
 import AppKit
 import SwiftUI
 
-/// Two-line caption card: source text above, translation below. Uses
-/// ultraThinMaterial for the frosted look and smooth cross-fades on text
-/// changes so partial updates don't flicker.
+/// Two-line, font-measured cues. The presenter owns reading time and the FIFO;
+/// the view never clips text or binds directly to the latest model paragraph.
 struct CaptionView: View {
     @Bindable var engine: TranslatorEngine
     @Bindable private var prefs = Preferences.shared
@@ -13,29 +12,52 @@ struct CaptionView: View {
     private var sourceFontSize: CGFloat { CGFloat(prefs.captionSourceFontSize) }
     private var isCompact: Bool { prefs.captionDisplayMode == .compact }
     private var shouldShowSource: Bool {
-        prefs.captionDisplayMode == .bilingual && !engine.sourceText.isEmpty
+        prefs.captionDisplayMode == .bilingual
+    }
+    private var typography: CaptionTypography {
+        CaptionTypography(width: isCompact ? 392 : 560,
+                          sourceSize: sourceFontSize, translationSize: translationFontSize,
+                          showsSource: shouldShowSource)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: isCompact ? 4 : 6) {
             header
 
-            if shouldShowSource {
-                Text(engine.sourceText)
-                    .font(.system(size: sourceFontSize, weight: .regular))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .transition(.opacity)
-            }
+            captionContent
+                .id(engine.captions.visible?.id)
+                .transition(.opacity)
+                .animation(.easeOut(duration: 0.12), value: engine.captions.visible?.id)
 
-            translationLine
+            HStack {
+                Text(engine.sessionNotice?.detail
+                     ?? (engine.captions.visible?.isCorrection == true ? "Updated wording"
+                         : engine.captions.visible?.isDraft == true ? "Live translation" : " "))
+                Spacer()
+                if let notice = engine.sessionNotice {
+                    switch notice {
+                    case .saved, .failed:
+                        Button("View history") { TranscriptHistoryWindowPresenter.shared.show() }
+                            .buttonStyle(.plain)
+                    case .saving, .empty: EmptyView()
+                    }
+                } else if engine.droppedUtteranceCount > 0 {
+                    Text("\(engine.droppedUtteranceCount) audio segments missed").foregroundStyle(.orange)
+                } else if engine.captions.queuedCount > 0 {
+                    Text("\(engine.captions.queuedCount) \(engine.captions.queuedCount == 1 ? "segment" : "segments") queued")
+                }
+            }
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
         }
         .padding(.horizontal, isCompact ? 14 : 20)
         .padding(.vertical, isCompact ? 12 : 16)
         .frame(width: isCompact ? 420 : 600, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(.ultraThinMaterial)
+                // A stable dark surface keeps captions legible over white
+                // slides and bright meeting windows as well as dark video.
+                .fill(Color(red: 0.055, green: 0.063, blue: 0.078).opacity(0.94))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
@@ -50,6 +72,9 @@ struct CaptionView: View {
         .padding(.top, 28)
         .padding(.bottom, 40)
         .fixedSize(horizontal: false, vertical: true)
+        .environment(\.colorScheme, .dark)
+        .onAppear { engine.captions.reflow(typography) }
+        .onChange(of: typography) { _, value in engine.captions.reflow(value) }
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.15)) {
                 isHovered = hovering
@@ -59,8 +84,8 @@ struct CaptionView: View {
         // of updates per second; animating each one makes the whole line
         // look like it's being "re-printed" every token. Tokens should
         // just append instantly.
-        .animation(.easeOut(duration: 0.18), value: engine.sourceText)
-        .animation(.easeOut(duration: 0.2), value: engine.phase)
+        // Source snapshots and status changes must not animate the caption
+        // subtree either — that also animates translation reflow implicitly.
     }
 
     // MARK: - Header
@@ -94,10 +119,11 @@ struct CaptionView: View {
         HStack(spacing: 4) {
             ControlButton(
                 systemImage: engine.phase == .listening ? "pause.fill" : "play.fill",
-                help: engine.phase == .listening ? "Pause listening" : "Resume listening"
+                help: engine.phase == .listening ? "End session" : "Start new session"
             ) {
                 engine.toggle()
             }
+            .disabled(engine.isCaptionPreview)
 
             ControlButton(systemImage: "gearshape", help: "Preferences") {
                 PreferencesWindowPresenter.shared.show(engine: engine)
@@ -107,10 +133,10 @@ struct CaptionView: View {
                 TranscriptHistoryWindowPresenter.shared.show()
             }
 
-            ControlButton(systemImage: "doc.on.doc", help: "Copy translation") {
+            ControlButton(systemImage: "doc.on.doc", help: "Copy visible subtitle") {
                 copyCurrentTranslation()
             }
-            .disabled(engine.translationText.isEmpty)
+            .disabled(engine.captions.visible?.translation.raw.isEmpty ?? true)
 
             ControlButton(
                 systemImage: "square.and.arrow.up",
@@ -129,22 +155,39 @@ struct CaptionView: View {
     }
 
     private func copyCurrentTranslation() {
-        guard !engine.translationText.isEmpty else { return }
+        guard let text = engine.captions.visible?.translation.raw, !text.isEmpty else { return }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.setString(engine.translationText, forType: .string)
+        pasteboard.setString(text, forType: .string)
     }
 
     // MARK: - Translation line
 
     @ViewBuilder
-    private var translationLine: some View {
-        let display = engine.translationText.isEmpty ? placeholderText : engine.translationText
-        Text(display)
-            .font(.system(size: translationFontSize, weight: .semibold, design: .rounded))
-            .foregroundStyle(engine.translationText.isEmpty ? Color.secondary : Color.primary)
-            .opacity(engine.isPartial && !engine.translationText.isEmpty ? 0.72 : 1.0)
+    private var captionContent: some View {
+        let cue = engine.captions.visible
+        let translation = cue?.translation.display ?? ""
+        VStack(alignment: .leading, spacing: isCompact ? 4 : 6) {
+            if shouldShowSource {
+                Text(cue?.source.display ?? "")
+                    .font(Font(typography.sourceFont))
+                    .foregroundStyle(.secondary)
+                    .frame(minHeight: lineHeight(typography.sourceFont) * 2, alignment: .topLeading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(engine.sessionNotice?.title ?? (!translation.isEmpty ? translation
+                 : cue != nil ? (cue?.isDraft == true ? "Translating…" : " ") : placeholderText))
+                .font(Font(typography.translationFont))
+                .foregroundStyle(!translation.isEmpty ? Color.primary : Color.secondary)
+                .frame(minHeight: lineHeight(typography.translationFont) * 2, alignment: .topLeading)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func lineHeight(_ font: NSFont) -> CGFloat {
+        ceil(font.ascender - font.descender + font.leading)
     }
 
     // MARK: - Status indicator
@@ -156,6 +199,14 @@ struct CaptionView: View {
     }
 
     private var statusColor: Color {
+        if let notice = engine.sessionNotice {
+            switch notice {
+            case .saving: return .orange
+            case .saved: return .green
+            case .empty: return .gray
+            case .failed: return .pink
+            }
+        }
         switch engine.phase {
         case .listening: return .red
         case .ready: return .green
@@ -166,11 +217,20 @@ struct CaptionView: View {
     }
 
     private var statusLabel: String {
+        if engine.isCaptionPreview { return "Caption preview" }
+        if let notice = engine.sessionNotice {
+            switch notice {
+            case .saving: return "Saving"
+            case .saved: return "Saved"
+            case .empty: return "Session ended"
+            case .failed: return "Save failed"
+            }
+        }
         switch engine.phase {
         case .idle: return "Idle"
         case .loading(let status, _): return status
-        case .ready: return "Ready"
-        case .listening: return "Listening"
+        case .ready: return engine.captions.isDraining ? "Finishing captions" : "Ready"
+        case .listening: return engine.isPartial ? "Live · Updating" : "Listening"
         case .error: return "Error"
         }
     }

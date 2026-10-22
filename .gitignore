@@ -12,3 +12,6 @@ macos/Ora/.dist/
 
 # iOS app is not part of this macOS pass
 ios/
+
+# XCTest/LLVM runtime coverage output
+*.profraw

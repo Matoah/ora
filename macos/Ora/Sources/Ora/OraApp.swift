@@ -123,12 +123,15 @@ struct OraApp: App {
         FileHandle.standardError.write("[app] init\n".data(using: .utf8) ?? Data())
         NSApplication.shared.setActivationPolicy(.accessory)
         let openPreferencesOnLaunch = CommandLine.arguments.contains("--open-preferences-on-launch")
+        let showCaptionsOnLaunch = CommandLine.arguments.contains("--show-captions-on-launch")
+        let bilingualPreview = CommandLine.arguments.contains("--caption-bilingual-preview")
+        let captionPreview = CommandLine.arguments.contains("--caption-layout-preview") || bilingualPreview
 
         let e = TranslatorEngine()
         _engine = State(initialValue: e)
 
         // Preload models in the background.
-        if !openPreferencesOnLaunch {
+        if !openPreferencesOnLaunch && !captionPreview {
             Task { await e.prepare() }
         }
 
@@ -146,6 +149,36 @@ struct OraApp: App {
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 800_000_000)
                 PreferencesWindowPresenter.shared.show(engine: e)
+            }
+        }
+        if showCaptionsOnLaunch {
+            Task { @MainActor in
+                PanelManager.shared.show(engine: e)
+            }
+        }
+        // Deterministic UI QA: no microphone, capture permission, inference,
+        // or transcript-history entries.
+        if captionPreview {
+            Task { @MainActor in
+                e.isCaptionPreview = true
+                e.phase = .ready
+                if bilingualPreview {
+                    e.captions.update(id: UUID(),
+                        source: "Classify material properties and geometry.",
+                        translation: "先检查物体。然后查看它的表面和内部结构。对材质属性和几何形状进行分类。",
+                        final: true)
+                    PanelManager.shared.show(engine: e)
+                    return
+                }
+                e.captions.update(id: UUID(),
+                    source: "Welcome to our meeting. Today we will review the budget and discuss the next steps for our project, including the release schedule and responsibilities for each team.",
+                    translation: "欢迎参加会议。今天我们将审查预算，并讨论项目的后续步骤，包括发布时间以及每个团队的职责分工。",
+                    final: true)
+                e.captions.update(id: UUID(),
+                    source: "Every sentence should remain visible long enough to read. New captions wait their turn instead of replacing unfinished text.",
+                    translation: "每条字幕都应留出足够的阅读时间。后面的字幕会按顺序等待，不会把还没读完的内容覆盖掉。",
+                    final: true)
+                PanelManager.shared.show(engine: e)
             }
         }
     }

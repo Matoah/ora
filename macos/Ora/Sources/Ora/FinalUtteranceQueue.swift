@@ -1,5 +1,11 @@
 import Foundation
 
+struct CapturedUtterance: Sendable {
+    let id: UUID
+    let audio: [Float]
+    let queuedAt = ContinuousClock.now
+}
+
 /// FIFO hand-off between the (fast, never-blocking) VAD dispatch loop and the
 /// finals worker that runs ASR + translation.
 ///
@@ -7,10 +13,11 @@ import Foundation
 /// explicitly counted, never silently. Partials may be conflated at will;
 /// a final IS the user's sentence, so every shed must be observable.
 actor FinalUtteranceQueue {
-    private var items: [[Float]] = []
-    private var waiter: CheckedContinuation<[Float]?, Never>?
+    private var items: [CapturedUtterance] = []
+    private var waiter: CheckedContinuation<CapturedUtterance?, Never>?
     private var finished = false
     private(set) var droppedCount = 0
+    private(set) var lastDroppedID: UUID?
 
     private let capacity: Int
 
@@ -21,16 +28,17 @@ actor FinalUtteranceQueue {
     /// Returns true when this enqueue shed the oldest queued utterance, so the
     /// caller can surface "captions fell behind" without a second actor hop.
     @discardableResult
-    func enqueue(_ audio: [Float]) -> Bool {
+    func enqueue(_ audio: [Float], id: UUID = UUID()) -> Bool {
         guard !finished else { return false }
+        let utterance = CapturedUtterance(id: id, audio: audio)
         if let waiter {
             self.waiter = nil
-            waiter.resume(returning: audio)
+            waiter.resume(returning: utterance)
             return false
         }
-        items.append(audio)
+        items.append(utterance)
         if items.count > capacity {
-            items.removeFirst()
+            lastDroppedID = items.removeFirst().id
             droppedCount += 1
             return true
         }
@@ -41,6 +49,10 @@ actor FinalUtteranceQueue {
     /// once the backlog is drained, or immediately when the caller is
     /// cancelled (so a stopped worker never hangs on a suspended dequeue).
     func dequeue() async -> [Float]? {
+        await dequeueUtterance()?.audio
+    }
+
+    func dequeueUtterance() async -> CapturedUtterance? {
         if !items.isEmpty {
             return items.removeFirst()
         }

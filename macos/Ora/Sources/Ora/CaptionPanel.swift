@@ -3,9 +3,9 @@ import SwiftUI
 
 /// Borderless floating panel hosting the CaptionView. Always on top,
 /// draggable by background, transparent chrome, persisted frame origin.
-/// Uses NSHostingController so the window automatically resizes to fit
-/// the SwiftUI content — long translations grow the card downward
-/// while keeping the top edge anchored.
+/// Uses NSHostingController to fit the selected caption font and layout.
+/// Long translations paginate into cues; the top edge stays anchored when
+/// the user changes font size or caption mode.
 final class CaptionPanel: NSPanel, NSWindowDelegate {
     private let hostingController: NSHostingController<CaptionView>
     private var savedTopY: CGFloat?

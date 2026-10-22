@@ -21,6 +21,12 @@ final class TranslatorEngine {
     var sourceText: String = ""
     var translationText: String = ""
     var isPartial: Bool = false
+    var liveSource = LiveSourceText()
+    var previousTranslation = ""
+    var isCaptionPreview = false
+    let captions = CaptionPresenter()
+    var sessionNotice: SessionNotice?
+    var recognizedUtteranceID: UUID? { displayedUtteranceID }
     var utteranceCount: Int = 0
     /// Utterances shed because ASR+translation fell behind sustained speech.
     /// Nonzero means the user lost sentences — surfaced, never silent.
@@ -46,12 +52,20 @@ final class TranslatorEngine {
     private var finalsWorkerTask: Task<Void, Never>?
     private var finalsQueue: FinalUtteranceQueue?
     private var partialPipe: PartialPipelineUI?
+    private var partialRevision = CaptionRevision(previous: "")
+    private var displayedUtteranceID: UUID?
+    private var latestTranslationID: UUID?
+    private var listeningSession = UUID()
+    private var activeSession: ListeningSession?
+    private var receiptGeneration = UUID()
+    private let historyOverride: TranscriptHistory?
+    private var history: TranscriptHistory { historyOverride ?? .shared }
     /// Engine-owned rolling few-shot context (recent source → translation
     /// pairs). Lives here — not on the backends — so it survives backend
     /// reloads and every backend gets identical context behavior.
     private let translationContext = TranslationContext()
 
-    nonisolated init() {}
+    nonisolated init(history: TranscriptHistory? = nil) { self.historyOverride = history }
 
     // MARK: - Prepare / reload
 
@@ -139,18 +153,27 @@ final class TranslatorEngine {
 
     // MARK: - Start / stop
 
-    func start() async {
+    func start(sourceOverride: (any AudioSource)? = nil) async {
         guard case .ready = phase else { return }
+        guard activeSession == nil else { return }
         guard let vad, let asr, let backend else { return }
+        clearCaptionDisplay()
+        sessionNotice = nil
+        receiptGeneration = UUID()
+        let session = UUID()
+        listeningSession = session
 
         let source: AudioSource?
         let sourceKind = Preferences.shared.audioSource
-        switch sourceKind {
+        if let sourceOverride {
+            source = sourceOverride
+        } else { switch sourceKind {
         case .microphone:
             source = MicrophoneCapture()
         case .systemAudio:
             source = await SystemAudioCapture.create()
-        }
+        } }
+        guard listeningSession == session, phase == .ready else { return }
         guard let source else {
             switch sourceKind {
             case .microphone:
@@ -162,20 +185,47 @@ final class TranslatorEngine {
         }
         self.audioSource = source
 
-        let pipe = PartialPipelineUI(asr: asr, backend: backend) { [weak self] src, translated in
-            Task { @MainActor [weak self] in
-                self?.sourceText = src
-                self?.translationText = translated
-                self?.isPartial = true
+        activeSession = ListeningSession(id: session)
+        history.beginSession(id: session)
+        let pipe = PartialPipelineUI(asr: asr, backend: backend, context: translationContext) { [weak self] src, translated, id in
+            await MainActor.run { [weak self] in
+                guard let self, self.listeningSession == session,
+                      self.phase == .listening else { return }
+                if translated == nil {
+                    if self.displayedUtteranceID != id {
+                        self.liveSource = LiveSourceText()
+                    }
+                    self.partialRevision = CaptionRevision(previous: self.latestTranslationID == id ? self.translationText : "")
+                    self.liveSource.update(src)
+                    self.displayedUtteranceID = id
+                }
+                self.sourceText = src
+                if let translated {
+                    self.translationText = self.partialRevision.update(translated)
+                    self.latestTranslationID = id
+                }
+                self.isPartial = true
+                self.captions.update(id: id, source: src,
+                                     translation: translated == nil ? nil : self.translationText)
+                self.notePendingTranscript(id: id, source: src,
+                                           translation: translated == nil ? nil : self.translationText)
             }
         }
-        Task { await pipe.start() }
+        await pipe.start()
+        guard listeningSession == session else {
+            await pipe.shutdown()
+            return
+        }
         self.partialPipe = pipe
 
         phase = .listening
         sourceText = ""
         translationText = ""
         isPartial = false
+        liveSource = LiveSourceText()
+        previousTranslation = ""
+        displayedUtteranceID = nil
+        latestTranslationID = nil
         droppedUtteranceCount = 0
         // Each listening session is a fresh conversation — stale exchanges
         // from hours ago would bias terminology and register.
@@ -203,21 +253,19 @@ final class TranslatorEngine {
                 endSilenceMs: prefEndSilenceMs
             )
 
+            var utteranceID = UUID()
             for await event in events {
                 guard let self else { break }
                 switch event {
                 case .speechStart:
-                    // Mark current content as "stale" but DON'T clear it —
-                    // blanking the card for the ~800 ms until the first
-                    // partial lands is more jarring than leaving the old
-                    // text visible. The incoming partial will overwrite
-                    // atomically via contentTransition.
-                    await MainActor.run {
-                        self.isPartial = true
-                    }
+                    // Keep the last readable caption until recognition
+                    // arrives. A new utterance starts with isPartial=false,
+                    // so its first token won't wait to catch up to the length
+                    // of the previous sentence.
+                    utteranceID = UUID()
 
                 case .partial(let audio):
-                    await pipe.submit(audio)
+                    await pipe.submit(audio, id: utteranceID)
 
                 case .final(let audio):
                     // Freeze now (fast — just a flag) so a stale partial of
@@ -225,8 +273,9 @@ final class TranslatorEngine {
                     // the worker waits for in-flight partial work before
                     // touching the GPU.
                     await pipe.freeze()
-                    let shed = await queue.enqueue(audio)
+                    let shed = await queue.enqueue(audio, id: utteranceID)
                     if shed {
+                        let droppedID = await queue.lastDroppedID
                         FileHandle.standardError.write(
                             "[engine] shed utterance under overload\n".data(using: .utf8) ?? Data()
                         )
@@ -234,6 +283,7 @@ final class TranslatorEngine {
                             // Ignore a lame-duck loop from a previous session.
                             guard self.finalsQueue === queue else { return }
                             self.droppedUtteranceCount += 1
+                            if let droppedID { self.captions.finish(id: droppedID) }
                         }
                     }
                 }
@@ -244,14 +294,17 @@ final class TranslatorEngine {
         // Finals worker: serially runs ASR + streamed translation per
         // utterance, decoupled from VAD event consumption.
         finalsWorkerTask = Task.detached { [weak self, asr, backend] in
-            while let audio = await queue.dequeue() {
+            while let utterance = await queue.dequeueUtterance() {
                 if Task.isCancelled { break }
                 guard let self else { break }
                 await self.processFinal(
-                    audio: audio,
+                    audio: utterance.audio,
+                    utteranceID: utterance.id,
+                    queuedAt: utterance.queuedAt,
                     pipe: pipe,
                     asr: asr,
-                    backend: backend
+                    backend: backend,
+                    session: session
                 )
                 // Unfreeze partials only once the backlog is drained — while
                 // more finals are queued, next-utterance partials would paint
@@ -271,11 +324,15 @@ final class TranslatorEngine {
     /// transcript history. Runs on the finals worker, never on the dispatch loop.
     nonisolated private func processFinal(
         audio: [Float],
+        utteranceID: UUID,
+        queuedAt: ContinuousClock.Instant,
         pipe: PartialPipelineUI,
         asr: ASRClient,
-        backend: any TranslationBackend
+        backend: any TranslationBackend,
+        session: UUID
     ) async {
         let segmentStart = Date()
+        let processingStart = ContinuousClock.now
         // The dispatch loop froze the pipe (discarding this utterance's stale
         // snapshot) at enqueue time; re-freezing here is an idempotent guard
         // against the small window where the worker's drain-time reset raced
@@ -285,10 +342,18 @@ final class TranslatorEngine {
         // the GPU.
         await pipe.freeze(discardPending: false)
         await pipe.awaitQuiescence()
+        guard !Task.isCancelled else { return }
 
+        let asrStart = ContinuousClock.now
         let text = await asr.transcribe(audio)
+        let asrDone = ContinuousClock.now
+        guard !Task.isCancelled else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.count < 2 {
+            await MainActor.run {
+                guard self.listeningSession == session else { return }
+                self.captions.finish(id: utteranceID)
+            }
             return
         }
 
@@ -299,21 +364,34 @@ final class TranslatorEngine {
         // empty / placeholder state for ~300ms before the LLM's
         // first token arrives. We let the incoming stream
         // replace the previous partial translation atomically.
-        await MainActor.run {
+        var revision = await MainActor.run {
+            let revision = CaptionRevision(previous: self.latestTranslationID == utteranceID ? self.translationText : "")
+            guard self.listeningSession == session else { return revision }
             self.sourceText = text
+            self.liveSource.commit(text)
             self.utteranceCount += 1
             self.isPartial = false
+            self.displayedUtteranceID = utteranceID
+            self.captions.update(id: utteranceID, source: text, translation: nil)
+            self.notePendingTranscript(id: utteranceID, source: text, translation: nil)
+            return revision
         }
 
         var fullTranslation = ""
+        var firstTokenAt: ContinuousClock.Instant?
         do {
             for try await chunk in backend.translateStream(text, history: translationContext.snapshot()) {
+                if firstTokenAt == nil, !chunk.isEmpty { firstTokenAt = .now }
                 fullTranslation += chunk
-                let snapshot = fullTranslation
+                let snapshot = revision.update(fullTranslation)
                 await MainActor.run {
+                    guard self.listeningSession == session else { return }
                     // Each chunk replaces the old partial text directly —
                     // no empty intermediate state.
                     self.translationText = snapshot
+                    self.latestTranslationID = utteranceID
+                    self.captions.update(id: utteranceID, source: text, translation: snapshot)
+                    self.notePendingTranscript(id: utteranceID, source: text, translation: snapshot)
                 }
             }
         } catch {
@@ -321,7 +399,11 @@ final class TranslatorEngine {
             // transcript or to the rolling context (mirrors main.py).
             if !(error is CancellationError) {
                 await MainActor.run {
+                    guard self.listeningSession == session else { return }
                     self.translationText = "[translate error: \(error)]"
+                    // Keep all recognized words available for reading even
+                    // when this utterance's translation fails.
+                    self.captions.update(id: utteranceID, source: text, translation: nil, final: true)
                 }
             }
             return
@@ -337,10 +419,14 @@ final class TranslatorEngine {
         if !finalTranslation.isEmpty {
             let endedAt = Date()
             await MainActor.run {
+                guard self.listeningSession == session else { return }
                 // Barge-in may have marked the card stale mid-stream; the
                 // completed final is committed content, restyle it as such.
                 self.translationText = finalTranslation
+                self.latestTranslationID = utteranceID
                 self.isPartial = false
+                self.previousTranslation = finalTranslation
+                self.captions.update(id: utteranceID, source: finalSource, translation: finalTranslation, final: true)
                 // Feed the committed pair back as rolling few-shot context so
                 // the next segment keeps pronouns/terminology consistent —
                 // unless the target language changed while we streamed, in
@@ -357,14 +443,32 @@ final class TranslatorEngine {
                     sourceLanguageHint: Preferences.shared.asrLanguage,
                     targetLanguage: Preferences.shared.targetLanguage,
                     audioSource: Preferences.shared.audioSource.rawValue,
-                    sessionId: TranscriptHistory.shared.sessionId
+                    sessionId: session
                 )
-                TranscriptHistory.shared.append(entry)
+                self.history.append(entry)
+                self.activeSession?.committed(utteranceID: utteranceID)
+            }
+        } else {
+            await MainActor.run {
+                guard self.listeningSession == session else { return }
+                self.captions.update(id: utteranceID, source: text, translation: nil, final: true)
             }
         }
+        func ms(_ from: ContinuousClock.Instant, _ to: ContinuousClock.Instant) -> Int {
+            let d = from.duration(to: to).components
+            return Int(Double(d.seconds) * 1000 + Double(d.attoseconds) / 1e15)
+        }
+        // Timing only: no speech or translation text is written to this log.
+        let report = "[pipeline-latency] queue_ms=\(ms(queuedAt, processingStart)) partial_wait_ms=\(ms(processingStart, asrStart)) asr_ms=\(ms(asrStart, asrDone)) first_token_ms=\(firstTokenAt.map { ms(asrDone, $0) } ?? -1) final_total_ms=\(ms(queuedAt, .now))\n"
+        FileHandle.standardError.write(Data(report.utf8))
     }
 
     func stop() {
+        let session = activeSession
+        activeSession = nil
+        let stoppedToken = UUID()
+        listeningSession = stoppedToken
+        clearCaptionDisplay()
         eventLoopTask?.cancel()
         eventLoopTask = nil
         // dequeue() is cancellation-aware, so cancel() alone releases a
@@ -381,9 +485,69 @@ final class TranslatorEngine {
         if case .listening = phase {
             phase = .ready
         }
+        guard let session else { return }
+        let receipt = UUID()
+        receiptGeneration = receipt
+        let endedAt = Date()
+        let elapsed = session.clockStart.duration(to: .now).components
+        let duration = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+        let unfinished = session.unfinishedEntry(endedAt: endedAt)
+        let history = self.history
+        if let unfinished { history.append(unfinished) }
+        let summary = SessionSummary(id: session.id, duration: duration,
+                                     savedLines: session.completedCount + (unfinished == nil ? 0 : 1),
+                                     unfinishedLines: unfinished == nil ? 0 : 1)
+        guard summary.savedLines > 0 else {
+            sessionNotice = .empty(summary)
+            return
+        }
+        sessionNotice = .saving(summary)
+        Task { [weak self, history] in
+            do {
+                try await history.flush(sessionID: session.id)
+                guard let self, self.receiptGeneration == receipt else { return }
+                self.sessionNotice = .saved(summary)
+            } catch {
+                guard let self, self.receiptGeneration == receipt else { return }
+                self.sessionNotice = .failed(summary, error.localizedDescription)
+            }
+        }
+    }
+
+    private func notePendingTranscript(id: UUID, source: String, translation: String?) {
+        let prefs = Preferences.shared
+        activeSession?.update(utteranceID: id, source: source, translation: translation,
+                              target: prefs.targetLanguage, sourceLanguage: prefs.asrLanguage,
+                              audioSource: prefs.audioSource.rawValue)
+    }
+
+    private func clearCaptionDisplay() {
+        captions.reset()
+        sourceText = ""
+        translationText = ""
+        previousTranslation = ""
+        liveSource = LiveSourceText()
+        isPartial = false
+        displayedUtteranceID = nil
+        latestTranslationID = nil
+        partialRevision = CaptionRevision(previous: "")
+        droppedUtteranceCount = 0
     }
 
     func toggle() {
+        guard !isCaptionPreview else { return }
+        if activeSession != nil {
+            stop()
+            return
+        }
+        if phase != .listening {
+            // A button/hotkey press clears immediately, including while the
+            // next start is waiting for model loading or audio permission.
+            clearCaptionDisplay()
+            sessionNotice = nil
+            receiptGeneration = UUID()
+            listeningSession = UUID() // invalidate an earlier save receipt immediately
+        }
         switch phase {
         case .listening:
             stop()

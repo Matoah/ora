@@ -217,7 +217,7 @@ struct TranscriptHistoryView: View {
         for entry in history.loadAll() {
             byId[entry.id] = entry
         }
-        for entry in history.currentSession {
+        for entry in history.inMemoryEntries {
             byId[entry.id] = entry
         }
         return byId.values.sorted { $0.startedAt > $1.startedAt }
@@ -342,6 +342,10 @@ private struct EntryRow: View {
                 Text(Self.timeFormatter.string(from: entry.startedAt))
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundStyle(.secondary)
+
+                if entry.isPartial == true {
+                    Text("Unfinished").font(.caption2).foregroundStyle(.orange)
+                }
 
                 Spacer()
 

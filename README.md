@@ -47,11 +47,24 @@ Ora listens to your microphone and streams live translations of what you say int
 
 ## Download
 
-Grab the signed and notarized `Ora.dmg` from the [latest release](https://github.com/wuwangzhang1216/ora/releases/latest), double-click to mount, drag **Ora.app** to **Applications**, launch.
+Grab `Ora.dmg` from the [latest release](https://github.com/wuwangzhang1216/ora/releases/latest), double-click to mount, and drag **Ora.app** to **Applications**.
+
+Release packages are signed with a Developer ID. Check the release notes for notarization status: **v0.8.0 is signed but not notarized** because Apple is requiring an updated developer agreement. macOS may block first launch until the package is notarized.
 
 - Requires **macOS 15 (Sequoia) or later** and an **Apple Silicon** Mac (M1/M2/M3/M4)
-- ~1.2 GB of model weights download on first launch
+- Model weights download on first launch; download size depends on the selected quality tier
 - First launch prompts for microphone access — required for speech capture
+
+### What's new in 0.8.0
+
+- Stream recognized speech immediately and translate token by token, entirely on device
+- Paginate captions at sentence, clause, and measured reading-length boundaries without clipping unread text
+- Keep already-read captions in order when recognition or translation revises earlier wording
+- Keep English visible while Chinese continues paging, and preserve the translation while longer source text finishes
+- Reduce display waits when another segment is queued; the default Meeting preset now finalizes after about 300 ms of silence
+- Share recent committed context between live and final translations, and prevent prompt labels such as “Source:” from appearing in subtitles
+- Clear captions at session start/end, save recognized unfinished speech, and show the session duration after local history writes succeed
+- Add deterministic caption regressions and real-model replay tests covering more than two minutes of continuous operation
 
 ### What's new in 0.6.2
 
@@ -110,6 +123,60 @@ The native macOS app includes the same daily-use tuning as the reference CLI:
 - **Room presets**: Quiet Room, Meeting, Noisy Room, or Custom VAD settings
 - **Fast copy**: copy the current or last translation from the menu bar, or from the caption card hover controls
 - **Transcript history**: export the current session or all history as TXT, SRT, JSON, or Markdown
+
+### Live captions for meetings
+
+For Zoom participants' voices, select **Preferences → General → Audio Input → System Audio**,
+then start listening. Select **Microphone** to caption your own voice. System Audio
+requires macOS Screen Recording permission and captures the system mix, including other apps.
+
+During speech, Ora displays the recognized source immediately and streams translated
+text as the local model generates it. A separate local caption scheduler breaks
+paragraphs at sentence punctuation, suitable clause boundaries, and reading-length
+limits. Each cue fits two lines measured with the actual caption font. Long text
+continues on subsequent cues instead of being cut off with an ellipsis.
+
+Cues use translation-first live pacing (normally 0.75–2.4 seconds per cue), shortening
+their dwell under backlog pressure (at most 1.2 seconds once another segment is
+queued). Long source text does not hold a short translation,
+and repeated wording revisions cannot indefinitely restart a page's reading clock.
+Unread text waits in order; later
+recognition and translation cannot replace a cue before its reading time finishes.
+The default Meeting endpoint waits about 300 ms of silence; explicit saved silence
+settings are preserved. Pipeline timing logs separate inference-queue wait, partial
+finalization wait, ASR time, and translation first-token time without logging speech.
+Slow partial updates (750 ms or longer) also report recognition/first-token timing and
+cancellation status, so live-path stalls can be distinguished from display waits.
+If speech outpaces reading, the display shows the number of queued segments rather
+than automatically skipping them. Starting or ending a session clears the caption
+display and its unread pages. Ending saves completed transcripts and the latest
+recognized unfinished utterance locally, then shows the session duration and a
+**Session saved** receipt only after disk writes succeed. Empty sessions are labeled
+as having no recognized speech; write failures remain available in memory for export
+through History. Each Start creates a separate history session. Caption read positions
+only move forward: revised wording is aligned with the current read boundary and
+updates unread text, without replaying old pages. The full corrected original and
+translation remain available in transcript history. Both live and final translations
+use the same rolling context of up to four recent committed exchanges (oversized
+exchanges are excluded), keeping pronouns and terminology consistent.
+When one language finishes paging earlier, its last page stays visible alongside
+the remaining pages of the same utterance. Held text is never consumed twice or
+carried into a different utterance. Final transcript history still stores whole
+utterances, independently of display pages.
+
+For a local presentation-only preview without recording or loading models:
+
+```bash
+cd macos/Ora
+./run.sh --caption-layout-preview
+# Reproduce unequal English/Chinese page counts:
+./run.sh --caption-bilingual-preview
+```
+
+The recognizer still processes rolling audio snapshots, rather than decoding every
+spoken word in isolation. Update speed depends on your Mac and the selected model;
+translation can revise wording as more context arrives. These changes run locally
+with the existing models and require no cloud service.
 
 ### Quality tiers
 

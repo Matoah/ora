@@ -5,6 +5,15 @@ import XCTest
 /// CoreML weights involved. This is the logic that regressed in the 0.6.2
 /// long-session freeze; keep it covered.
 final class VADSegmenterTests: XCTestCase {
+    func testMeetingDefaultEndsSentenceDuringBriefConversationalPause() async {
+        let probs = [Float](repeating: 0.9, count: 20)
+            + [Float](repeating: 0.1, count: 10) // 320 ms pause
+            + [Float](repeating: 0.9, count: 20)
+            + [Float](repeating: 0.1, count: 20)
+        let events = await run(probs: probs, endSilenceMs: Config.speechEndMs)
+        let finals = events.filter { if case .final = $0 { return true }; return false }
+        XCTAssertEqual(finals.count, 2, "a brief meeting pause should not merge two sentences into one long inference window")
+    }
     private let frame = Config.vadFrameSamples
 
     /// Runs the segmenter over scripted per-frame speech probabilities and

@@ -13,12 +13,12 @@ enum Config {
     static var vadStopThreshold: Float { max(0.0, vadThreshold - vadHysteresis) }
 
     static let speechStartFrames = 3              // ~96ms voiced before we trigger start
-    static let speechEndMs = 500                  // trailing silence to end an utterance (industry-standard balance)
+    static let speechEndMs = 300                  // finalize brief meeting pauses without waiting half a second
     static let preRollMs = 200                    // audio kept before speech start
     static let minUtteranceMs = 300               // drop anything shorter
     static let maxUtteranceS: Double = 15         // safety cap for run-on speech
 
-    static let partialIntervalS: Double = 0.6     // rolling partial cadence (~500 ms is industry norm)
+    static let partialIntervalS: Double = 0.4     // source-first updates; inference coalesces excess snapshots
     static let partialMinGrowthS: Double = 0.3    // skip partial unless buffer grew this much
 
     // Backpressure caps. The dispatch loop consumes VAD events without blocking
@@ -110,7 +110,7 @@ enum VADPreset: String, CaseIterable {
     var settings: (threshold: Double, speechEndMs: Int)? {
         switch self {
         case .quiet: return (0.42, 650)
-        case .meeting: return (0.50, 500)
+        case .meeting: return (0.50, 300)
         case .noisy: return (0.68, 420)
         case .custom: return nil
         }

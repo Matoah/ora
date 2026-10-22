@@ -120,7 +120,7 @@ echo "[pkg] DMG: $DMG_PATH ($(du -h "$DMG_PATH" | cut -f1))"
 
 # ── Notarize (if profile present) ──────────────────────────────────────
 if [ "$SIGN_MODE" = "developer-id" ]; then
-    if xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+    if NOTARY_CHECK_OUTPUT="$(xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" 2>&1)"; then
         echo "[pkg] submitting for notarization (profile: $NOTARY_PROFILE)..."
         xcrun notarytool submit "$DMG_PATH" \
             --keychain-profile "$NOTARY_PROFILE" \
@@ -130,18 +130,10 @@ if [ "$SIGN_MODE" = "developer-id" ]; then
         xcrun stapler staple "$DMG_PATH"
         xcrun stapler staple "$APP_DIR"
     else
-        cat >&2 <<EOF
-[pkg] ⚠ Notary profile "$NOTARY_PROFILE" not found — skipping notarization.
-      DMG is signed but unnotarized. Gatekeeper will warn on first open.
-      To enable notarization, run once:
-
-        xcrun notarytool store-credentials "$NOTARY_PROFILE" \\
-            --apple-id YOUR_APPLE_ID \\
-            --team-id 46KF5Z549N \\
-            --password YOUR_APP_SPECIFIC_PASSWORD
-
-      Get an app-specific password at https://appleid.apple.com/account/manage
-EOF
+        printf '%s\n' "$NOTARY_CHECK_OUTPUT" >&2
+        echo "[pkg] Notarization unavailable for profile '$NOTARY_PROFILE'." >&2
+        echo "[pkg] DMG is signed but NOT notarized; macOS may block first launch." >&2
+        echo "[pkg] Resolve the Apple error above before distributing it as notarized." >&2
     fi
 fi
 

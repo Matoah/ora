@@ -2,6 +2,17 @@ import XCTest
 @testable import Ora
 
 final class FinalUtteranceQueueTests: XCTestCase {
+    func testUtteranceIdentitySurvivesQueueAndOverloadReportsDroppedID() async {
+        let queue = FinalUtteranceQueue(capacity: 1)
+        let first = UUID(), second = UUID()
+        await queue.enqueue([1], id: first)
+        await queue.enqueue([2], id: second)
+        let dropped = await queue.lastDroppedID
+        XCTAssertEqual(dropped, first)
+        let value = await queue.dequeueUtterance()
+        XCTAssertEqual(value?.id, second)
+        XCTAssertEqual(value?.audio, [2])
+    }
     func testFIFOOrder() async {
         let q = FinalUtteranceQueue(capacity: 8)
         await q.enqueue([1])

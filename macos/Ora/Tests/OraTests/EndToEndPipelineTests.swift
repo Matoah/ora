@@ -7,6 +7,132 @@ import XCTest
 /// Skipped automatically when the models are not already in the local
 /// Hugging Face cache, so CI without weights stays green.
 final class EndToEndPipelineTests: XCTestCase {
+    /// Exercise the actual engine, including VAD pauses, finalization freezes,
+    /// live partials, and caption presentation, at microphone playback speed.
+    /// Uses generated speech and a temporary transcript store, never capture.
+    @MainActor
+    func testRealTimeEngineDoesNotBlockNextSpeechAfterPause() async throws {
+        try requireModels()
+        try XCTSkipUnless(Self.cached("mlx-community/Qwen3.5-9B-MLX-4bit"), "9B weights must already be cached")
+        // XCTest has its own defaults domain; explicitly exercise the user's
+        // 9B Chinese translation configuration rather than the 2B default.
+        let preferences = Preferences.shared
+        let oldQuality = preferences.quality, oldTarget = preferences.targetLanguage
+        let oldLanguage = preferences.asrLanguage
+        preferences.quality = .extraHigh
+        preferences.targetLanguage = "Chinese"
+        preferences.asrLanguage = "en"
+        defer {
+            preferences.quality = oldQuality
+            preferences.targetLanguage = oldTarget
+            preferences.asrLanguage = oldLanguage
+        }
+        let first = try synthesizeSpeech("Today we will review our project budget and discuss the release schedule and the responsibilities of each team.")
+        let second = try synthesizeSpeech("Blue notebooks are ready for tomorrow.")
+        let secondStartsAt = Double(first.count) / Double(Config.sampleRate)
+        let audio = first + second
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ora-engine-replay-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let history = TranscriptHistory(directory: directory)
+        let engine = TranslatorEngine(history: history)
+        await engine.prepare()
+        XCTAssertEqual(engine.phase, .ready)
+        let started = ContinuousClock.now
+        await engine.start(sourceOverride: PacedSpeechFixture(audio: audio))
+        XCTAssertEqual(engine.phase, .listening)
+        var nextSourceAt: Double?
+        var firstUtteranceID: UUID?
+        let deadline = started + .seconds(Double(audio.count) / Double(Config.sampleRate) + 15)
+        while ContinuousClock.now < deadline {
+            let d = started.duration(to: .now).components
+            let elapsed = Double(d.seconds) + Double(d.attoseconds) / 1e18
+            if elapsed < secondStartsAt {
+                firstUtteranceID = engine.recognizedUtteranceID
+            } else if nextSourceAt == nil, let id = engine.recognizedUtteranceID,
+                      id != firstUtteranceID, !engine.sourceText.isEmpty {
+                nextSourceAt = elapsed
+            }
+            if nextSourceAt != nil, history.currentSession.count >= 2 { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let nextSourceDelay = nextSourceAt.map { $0 - secondStartsAt }
+        let report = "[engine-replay] next_source_after_speech_start_s=\(nextSourceDelay ?? -1) finalized_lines=\(history.currentSession.count)\n"
+            + "[engine-replay] synthetic_sources=\(history.currentSession.map(\.sourceText))\n"
+        FileHandle.standardError.write(Data(report.utf8))
+        XCTAssertNotNil(nextSourceDelay, "the next utterance must become visible")
+        if let nextSourceDelay { XCTAssertLessThan(nextSourceDelay, 2.5, "the previous final must not indefinitely freeze new speech") }
+        let sessionID = history.sessionId
+        engine.stop()
+        try await history.flush(sessionID: sessionID)
+    }
+
+    @MainActor
+    func testSixtySecondEngineReplayDoesNotReturnToOldCues() async throws {
+        try requireModels()
+        try XCTSkipUnless(Self.cached("mlx-community/Qwen3.5-9B-MLX-4bit"), "9B weights must already be cached")
+        let preferences = Preferences.shared
+        let oldQuality = preferences.quality, oldTarget = preferences.targetLanguage
+        let oldLanguage = preferences.asrLanguage
+        preferences.quality = .extraHigh
+        preferences.targetLanguage = "Chinese"
+        preferences.asrLanguage = "en"
+        defer {
+            preferences.quality = oldQuality
+            preferences.targetLanguage = oldTarget
+            preferences.asrLanguage = oldLanguage
+        }
+        let topics = ["budget", "schedule", "design", "testing", "shipping", "training", "support", "security", "research", "feedback", "planning", "launch"]
+        var audio = [Float]()
+        for topic in topics {
+            audio += try synthesizeSpeech("Let us discuss our \(topic) today. We should review the details carefully before making the final decision.")
+        }
+        let duration = Double(audio.count) / Double(Config.sampleRate)
+        XCTAssertGreaterThan(duration, 60)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ora-long-replay-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let history = TranscriptHistory(directory: directory)
+        let engine = TranslatorEngine(history: history)
+        await engine.prepare()
+        XCTAssertEqual(engine.phase, .ready)
+        await engine.start(sourceOverride: PacedSpeechFixture(audio: audio))
+        let began = ContinuousClock.now
+        let deadline = began + .seconds(duration + 15)
+        var lastUtterance: UUID?, lastCue: UUID?
+        var seenUtterances = Set<UUID>(), seenCues = Set<UUID>()
+        var sourcePages: [UUID: Set<String>] = [:]
+        var pagesAfterFortySeconds = 0
+        var maximumQueue = 0
+        while ContinuousClock.now < deadline {
+            if let cue = engine.captions.visible, cue.id != lastCue {
+                if cue.utteranceID != lastUtterance {
+                    XCTAssertFalse(seenUtterances.contains(cue.utteranceID), "cannot return to a previous utterance")
+                    seenUtterances.insert(cue.utteranceID)
+                    lastUtterance = cue.utteranceID
+                }
+                XCTAssertFalse(seenCues.contains(cue.id), "cannot return to a previous cue")
+                seenCues.insert(cue.id)
+                let text = cue.source.display
+                if text.count > 12, !cue.source.raw.isEmpty {
+                    XCTAssertFalse(sourcePages[cue.utteranceID, default: []].contains(text), "cannot replay a read source page: \(text)")
+                    sourcePages[cue.utteranceID, default: []].insert(text)
+                }
+                lastCue = cue.id
+                if ContinuousClock.now > began + .seconds(40) { pagesAfterFortySeconds += 1 }
+            }
+            maximumQueue = max(maximumQueue, engine.captions.queuedCount)
+            if ContinuousClock.now > began + .seconds(duration + 2), !engine.captions.isDraining { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertGreaterThan(pagesAfterFortySeconds, 5, "must verify active caption updates beyond 40 seconds")
+        XCTAssertGreaterThan(history.currentSession.count, 8)
+        XCTAssertFalse(engine.captions.isDraining, "captions must catch up after speech ends")
+        XCTAssertEqual(engine.droppedUtteranceCount, 0)
+        FileHandle.standardError.write(Data("[long-engine-replay] audio_s=\(duration) cues=\(seenCues.count) cues_after_40s=\(pagesAfterFortySeconds) finals=\(history.currentSession.count) max_caption_queue=\(maximumQueue)\n".utf8))
+        let sessionID = history.sessionId
+        engine.stop()
+        try await history.flush(sessionID: sessionID)
+    }
+
     private static let hubCache = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".cache/huggingface/hub")
 
@@ -156,6 +282,101 @@ final class EndToEndPipelineTests: XCTestCase {
     // non-trimmable MambaCache on linear layers → KVCacheError at first
     // generation). The feature was removed; see Config.swift.
 
+    func testTranslationDoesNotEchoSourceLabelsOrHistory() async throws {
+        try requireModels()
+        let modelID = ProcessInfo.processInfo.environment["ORA_E2E_TRANSLATOR_MODEL"]
+            ?? "mlx-community/Qwen3.5-2B-MLX-4bit"
+        try XCTSkipUnless(Self.cached(modelID), "translator weights must already be cached")
+        let translator = try await MLXChatTranslator.load(modelId: modelID, targetLanguage: "Chinese")
+        let fork = "This is a fork that my dishwasher failed to clean."
+        let partial = try await translator.translate(fork)
+        XCTAssertFalse(partial.contains("来源") || partial.contains("Source:"), partial)
+        XCTAssertTrue(partial.contains("叉"), partial)
+        let history = [TranslationExchange(source: "Good morning.", translation: "早上好。")]
+        for text in [fork, "Good evening, my friend."] {
+            var output = ""
+            var updates = 0
+            for try await chunk in translator.translateStream(text, history: history) {
+                output += chunk
+                updates += 1
+                XCTAssertFalse(output.contains("来源") || output.contains("Source:"), output)
+            }
+            XCTAssertGreaterThan(updates, 1, "translation must still stream")
+            XCTAssertFalse(output.contains("早上好"), "must not repeat previous translation: \(output)")
+            XCTAssertTrue(text == fork ? output.contains("叉") : output.contains("晚上"), output)
+            FileHandle.standardError.write(Data("[translation-label-regression] \(text) => \(output)\n".utf8))
+        }
+        let literal = try await translator.translate("The source of this information is Wikipedia.")
+        XCTAssertTrue(literal.contains("来源") || literal.contains("来自"), "legitimate source meaning must survive: \(literal)")
+    }
+
+    func testLiveCaptionStreamingWithRealModels() async throws {
+        try requireModels()
+        let modelID = ProcessInfo.processInfo.environment["ORA_E2E_TRANSLATOR_MODEL"]
+            ?? "mlx-community/Qwen3.5-2B-MLX-4bit"
+        try XCTSkipUnless(Self.cached(modelID), "requested translator must already be cached")
+        let samples = try synthesizeSpeech("Welcome to our meeting. Today we will review the budget and discuss the next steps for our project.")
+        let asr = try await ASRClient.load(modelId: "aufklarer/Qwen3-ASR-1.7B-MLX-8bit", language: "en")
+        let translator = try await MLXChatTranslator.load(
+            modelId: modelID, targetLanguage: "Chinese"
+        )
+        actor Timeline {
+            var events: [(Double, String, String?)] = []
+            let start = ContinuousClock.now
+            func append(_ source: String, _ translation: String?) {
+                let duration = start.duration(to: .now).components
+                let seconds = Double(duration.seconds) + Double(duration.attoseconds) / 1e18
+                events.append((seconds, source, translation))
+            }
+        }
+        let timeline = Timeline()
+        let sourceReady = expectation(description: "real ASR displayed")
+        let firstToken = expectation(description: "real translation streaming")
+        let pipe = PartialPipeline(asr: asr, backend: translator) { source, translation, _ in
+            await timeline.append(source, translation)
+            if translation == nil { sourceReady.fulfill() }
+            // Only the first non-empty translation fires this expectation.
+            let events = await timeline.events
+            if translation != nil, events.filter({ $0.2 != nil }).count == 1 { firstToken.fulfill() }
+        }
+        await pipe.start()
+        await pipe.submit(samples)
+        await fulfillment(of: [sourceReady, firstToken], timeout: 90)
+        await pipe.awaitQuiescence()
+        let events = await timeline.events
+        XCTAssertNil(events.first?.2)
+        let chunks = events.compactMap { $0.2 }
+        XCTAssertGreaterThan(chunks.count, 1, "must display intermediate translated chunks")
+        XCTAssertTrue(chunks.last?.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) } == true)
+        XCTAssertTrue(events.first?.1.lowercased().contains("meeting") == true)
+        // Run the actual streamed model output through the presentation
+        // layer, then let its virtual reading clock drain without more audio.
+        var captions = CaptionScheduler()
+        let utteranceID = UUID()
+        for event in events {
+            captions.update(id: utteranceID, source: event.1, translation: event.2, final: false, now: 0)
+        }
+        captions.update(id: utteranceID, source: events.last?.1 ?? "", translation: chunks.last, final: true, now: 0)
+        var renderedSource = ""
+        var renderedTranslation = ""
+        var cueCount = 0
+        while let cue = captions.current, cueCount < 100 {
+            renderedSource += cue.source.raw
+            renderedTranslation += cue.translation.raw
+            cueCount += 1
+            guard let deadline = captions.nextDeadline else { break }
+            captions.advance(now: deadline + 0.01)
+        }
+        XCTAssertFalse(captions.isDraining)
+        XCTAssertEqual(renderedSource, events.last?.1)
+        XCTAssertEqual(renderedTranslation, chunks.last)
+        let firstTranslation = events.first { $0.2 != nil }?.0 ?? -1
+        let report = "[live-caption-e2e] model=\(modelID) source=\(events.first?.0 ?? -1)s firstTranslation=\(firstTranslation)s complete=\(events.last?.0 ?? -1)s updates=\(chunks.count)\n"
+            + "[live-caption-e2e] sourceText=\(events.first?.1 ?? "") translation=\(chunks.last ?? "")\n"
+        FileHandle.standardError.write(Data(report.utf8))
+        await pipe.shutdown()
+    }
+
     /// Freeze semantics with real inference in flight: after freeze() +
     /// awaitQuiescence() no partial may draw, and a snapshot submitted while
     /// frozen survives to be processed after reset.
@@ -177,7 +398,7 @@ final class EndToEndPipelineTests: XCTestCase {
         }
         let log = DrawLog()
 
-        let pipe = PartialPipeline(asr: asr, backend: translator) { source, _ in
+        let pipe = PartialPipeline(asr: asr, backend: translator) { source, _, _ in
             log.append(source)
         }
         await pipe.start()
@@ -205,5 +426,29 @@ final class EndToEndPipelineTests: XCTestCase {
                              "snapshot submitted while frozen must be processed after reset")
 
         await pipe.shutdown()
+    }
+}
+
+private final class PacedSpeechFixture: AudioSource, @unchecked Sendable {
+    let audio: [Float]
+    init(audio: [Float]) { self.audio = audio }
+
+    func stream() -> AsyncStream<[Float]> {
+        AsyncStream { continuation in
+            let task = Task.detached { [audio] in
+                let start = ContinuousClock.now
+                var offset = 0
+                while offset < audio.count, !Task.isCancelled {
+                    let end = min(offset + Config.vadFrameSamples, audio.count)
+                    continuation.yield(Array(audio[offset..<end]))
+                    offset = end
+                    do {
+                        try await Task.sleep(until: start + .seconds(Double(end) / Double(Config.sampleRate)), clock: .continuous)
+                    } catch { break }
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 }
